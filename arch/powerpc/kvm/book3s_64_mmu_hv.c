@@ -1165,14 +1165,14 @@ static int resize_hpt_allocate(struct kvm_resize_hpt *resize)
 
 	rc = kvmppc_allocate_hpt(&resize->hpt, resize->order);
 	if (rc == -ENOMEM)
-		return H_NO_MEM;
+		return -ENOMEM;
 	else if (rc < 0)
-		return H_HARDWARE;
+		return -EIO;
 
 	resize_hpt_debug(resize, "resize_hpt_allocate(): HPT @ 0x%lx\n",
 			 resize->hpt.virt);
 
-	return H_SUCCESS;
+	return 0;
 }
 
 static unsigned long resize_hpt_rehash_hpte(struct kvm_resize_hpt *resize,
@@ -1197,14 +1197,14 @@ static unsigned long resize_hpt_rehash_hpte(struct kvm_resize_hpt *resize,
 	 * safe to check this before we take the HPTE lock */
 	vpte = be64_to_cpu(hptep[0]);
 	if (!(vpte & HPTE_V_VALID) && !(vpte & HPTE_V_ABSENT))
-		return H_SUCCESS;
+		return 0;
 
 	while (!try_lock_hpte(hptep, HPTE_V_HVLOCK))
 		cpu_relax();
 
 	vpte = be64_to_cpu(hptep[0]);
 
-	ret = H_SUCCESS;
+	ret = 0;
 	if (!(vpte & HPTE_V_VALID) && !(vpte & HPTE_V_ABSENT))
 		/* Nothing to do */
 		goto out;
@@ -1213,7 +1213,7 @@ static unsigned long resize_hpt_rehash_hpte(struct kvm_resize_hpt *resize,
 	rev = &old->rev[idx];
 	guest_rpte = rev->guest_rpte;
 
-	ret = H_HARDWARE;
+	ret = -EIO;
 	apsize = hpte_page_size(vpte, guest_rpte);
 	if (!apsize)
 		goto out;
@@ -1242,7 +1242,7 @@ static unsigned long resize_hpt_rehash_hpte(struct kvm_resize_hpt *resize,
 	BUG_ON(vpte & HPTE_V_VALID);
 	BUG_ON(!(vpte & HPTE_V_ABSENT));
 
-	ret = H_SUCCESS;
+	ret = 0;
 	if (!(vpte & HPTE_V_BOLTED))
 		goto out;
 
@@ -1292,12 +1292,10 @@ static unsigned long resize_hpt_rehash_hpte(struct kvm_resize_hpt *resize,
 	if (replace_vpte & (HPTE_V_VALID | HPTE_V_ABSENT)) {
 		BUG_ON(new->order >= old->order);
 
-		ret = H_PTEG_FULL;
 		if (replace_vpte & HPTE_V_BOLTED) {
-			ret = H_PTEG_FULL;
 			if (vpte & HPTE_V_BOLTED)
 				/* Bolted collision, nothing we can do */
-				ret = H_PTEG_FULL;
+				ret = -ENOSPC;
 			/* Discard the new HPTE */
 			goto out;
 		}
@@ -1324,11 +1322,11 @@ static int resize_hpt_rehash(struct kvm_resize_hpt *resize)
 
 	for (i = 0; i < kvmppc_hpt_npte(&kvm->arch.hpt); i++) {
 		rc = resize_hpt_rehash_hpte(resize, i);
-		if (rc != H_SUCCESS)
+		if (rc)
 			return rc;
 	}
 
-	return H_SUCCESS;
+	return 0;
 }
 
 static void resize_hpt_pivot(struct kvm_resize_hpt *resize)
@@ -1387,19 +1385,19 @@ static void resize_hpt_prepare_work(struct work_struct *work)
 	mutex_unlock(&kvm->lock);
 }
 
-unsigned long do_h_resize_hpt_prepare(struct kvm_vcpu *vcpu,
-				      unsigned long flags,
-				      unsigned long shift)
+long kvm_vm_ioctl_resize_hpt_prepare(struct kvm *kvm,
+				     struct kvm_ppc_resize_hpt *rhpt)
 {
-	struct kvm *kvm = vcpu->kvm;
+	unsigned long flags = rhpt->flags;
+	unsigned long shift = rhpt->shift;
 	struct kvm_resize_hpt *resize;
 	int ret;
 
 	if (flags != 0)
-		return H_PARAMETER;
+		return -EINVAL;
 
 	if (shift && ((shift < 18) || (shift > 46)))
-		return H_PARAMETER;
+		return -EINVAL;
 
 	mutex_lock(&kvm->lock);
 
@@ -1410,7 +1408,7 @@ unsigned long do_h_resize_hpt_prepare(struct kvm_vcpu *vcpu,
 			/* Suitable resize in progress */
 			if (resize->prepare_done) {
 				ret = resize->error;
-				if (ret != H_SUCCESS)
+				if (ret)
 					resize_hpt_release(kvm, resize);
 			} else {
 				ret = H_LONG_BUSY_ORDER_100_MSEC;
@@ -1423,7 +1421,7 @@ unsigned long do_h_resize_hpt_prepare(struct kvm_vcpu *vcpu,
 		resize_hpt_release(kvm, resize);
 	}
 
-	ret = H_SUCCESS;
+	ret = 0;
 	if (!shift)
 		goto out; /* nothing to do */
 
@@ -1437,7 +1435,7 @@ unsigned long do_h_resize_hpt_prepare(struct kvm_vcpu *vcpu,
 
 	schedule_work(&resize->work);
 
-	ret = H_LONG_BUSY_ORDER_100_MSEC;
+	ret = 100; /* ms */
 
 out:
 	mutex_unlock(&kvm->lock);
@@ -1449,26 +1447,26 @@ static void resize_hpt_boot_vcpu(void *opaque)
 	/* Nothing to do, just force a KVM exit */
 }
 
-unsigned long do_h_resize_hpt_commit(struct kvm_vcpu *vcpu,
-				     unsigned long flags,
-				     unsigned long shift)
+long kvm_vm_ioctl_resize_hpt_commit(struct kvm *kvm,
+				    struct kvm_ppc_resize_hpt *rhpt)
 {
-	struct kvm *kvm = vcpu->kvm;
+	unsigned long flags = rhpt->flags;
+	unsigned long shift = rhpt->shift;
 	struct kvm_resize_hpt *resize;
 	long ret;
 
 	if (flags != 0)
-		return H_PARAMETER;
+		return -EINVAL;
 
 	if (shift && ((shift < 18) || (shift > 46)))
-		return H_PARAMETER;
+		return -EINVAL;
 
 	mutex_lock(&kvm->lock);
 
 	resize = kvm->arch.resize_hpt;
 	
 	/* This shouldn't be possible */
-	ret = H_HARDWARE;
+	ret = -EIO;
 	if (WARN_ON(!kvm->arch.hpte_setup_done))
 		goto out_no_hpt;
 
@@ -1480,21 +1478,21 @@ unsigned long do_h_resize_hpt_commit(struct kvm_vcpu *vcpu,
 	 * hpte_setup_done */
 	on_each_cpu(resize_hpt_boot_vcpu, NULL, 1);
 
-	ret = H_NOT_ACTIVE;
+	ret = -ENXIO;
 	if (!resize || (resize->order != shift))
 		goto out;
 
-	ret = H_IN_PROGRESS;
+	ret = -EBUSY;
 	if (!resize->prepare_done)
 		goto out;
 
 	ret = resize->error;
-	if (ret != H_SUCCESS)
+	if (ret)
 		goto out;
 
 	ret = resize_hpt_rehash(resize);
 
-	if (ret != H_SUCCESS)
+	if (ret)
 		goto out;
 
 	resize_hpt_pivot(resize);
